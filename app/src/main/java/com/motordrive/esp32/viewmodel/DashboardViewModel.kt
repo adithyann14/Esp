@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import com.motordrive.esp32.data.ConnectionConfig
 import com.motordrive.esp32.data.Esp32Repository
 import com.motordrive.esp32.data.MotorState
+import com.motordrive.esp32.data.PendingAlert
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -14,11 +15,21 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
+/**
+ * Which sensor cards the user wants visible at runtime.
+ * Saved to prefs immediately when any toggle changes — no Save button needed.
+ */
+data class SensorVisibility(
+    val showVoltage: Boolean = true,   // MODULE A
+    val showCurrent: Boolean = true,   // MODULE B
+    val showWater:   Boolean = true    // MODULE C
+)
+
 class DashboardViewModel(app: Application) : AndroidViewModel(app) {
 
     private val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    // ── Exposed state ─────────────────────────────────────────────
+    // ── Public state ──────────────────────────────────────────────
     private val _motorState = MutableStateFlow(MotorState())
     val motorState: StateFlow<MotorState> = _motorState.asStateFlow()
 
@@ -27,6 +38,12 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+
+    private val _sensorVisibility = MutableStateFlow(loadSensorVisibility())
+    val sensorVisibility: StateFlow<SensorVisibility> = _sensorVisibility.asStateFlow()
+
+    private val _pendingAlerts = MutableStateFlow<List<PendingAlert>>(emptyList())
+    val pendingAlerts: StateFlow<List<PendingAlert>> = _pendingAlerts.asStateFlow()
 
     // ── Polling ───────────────────────────────────────────────────
     private var pollJob: Job? = null
@@ -46,8 +63,6 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
     fun stopPolling() { pollJob?.cancel() }
 
     private suspend fun poll() {
-        // Result.onSuccess/onFailure take NON-SUSPEND lambdas — safe to use here
-        // because neither callback calls a suspend function.
         repo().getStatus()
             .onSuccess { _motorState.value = it }
             .onFailure { err ->
@@ -56,52 +71,52 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
                     errorMessage = err.message ?: "Connection failed"
                 )
             }
+
+        repo().getAlerts()
+            .onSuccess { alerts -> if (alerts.isNotEmpty()) _pendingAlerts.value = alerts }
     }
 
-    // ── Motor commands ────────────────────────────────────────────
-
+    // ── Commands ──────────────────────────────────────────────────
     fun motorOn()  = sendCmd(true)
     fun motorOff() = sendCmd(false)
 
     private fun sendCmd(on: Boolean) = viewModelScope.launch {
-        // FIX BUG 4: guard against double-tap firing two concurrent commands
         if (_isLoading.value) return@launch
-
         _isLoading.value = true
-
         val result = if (on) repo().motorOn() else repo().motorOff()
-
-        // FIX BUG 1: Result.onSuccess { } takes a NON-SUSPEND lambda, so delay() and
-        // poll() (both suspend functions) cannot be called inside it — compile error.
-        // Replaced with a plain if/else inside the coroutine body where suspend calls are valid.
-        if (result.isSuccess) {
-            delay(400)   // brief wait so ESP32 state settles before re-polling
-            poll()
-        } else {
-            _motorState.value = _motorState.value.copy(
-                errorMessage = result.exceptionOrNull()?.message ?: "Command failed"
-            )
-        }
-
+        if (result.isSuccess) { delay(400); poll() }
+        else _motorState.value = _motorState.value.copy(
+            errorMessage = result.exceptionOrNull()?.message ?: "Command failed"
+        )
         _isLoading.value = false
     }
 
     fun refresh() = viewModelScope.launch { poll() }
 
-    // ── Settings ──────────────────────────────────────────────────
+    fun clearAlerts() = viewModelScope.launch {
+        repo().clearAlerts()
+        _pendingAlerts.value = emptyList()
+    }
 
+    // ── Settings ──────────────────────────────────────────────────
     fun updateConfig(cfg: ConnectionConfig) {
         _config.value = cfg
         saveConfig(cfg)
         startPolling()
     }
 
-    // ── Helpers ───────────────────────────────────────────────────
+    /** Called immediately when a sensor toggle changes — no Save needed. */
+    fun updateSensorVisibility(v: SensorVisibility) {
+        _sensorVisibility.value = v
+        saveSensorVisibility(v)
+    }
 
+    // ── Helpers ───────────────────────────────────────────────────
     private fun repo() = Esp32Repository(_config.value)
 
+    // ── Persistence ───────────────────────────────────────────────
     private fun loadConfig() = ConnectionConfig(
-        directIp            = prefs.getString(K_IP,  "192.168.4.1") ?: "192.168.4.1",
+        directIp            = prefs.getString(K_IP, "192.168.4.1") ?: "192.168.4.1",
         port                = prefs.getInt(K_PORT, 80),
         useServerMode       = prefs.getBoolean(K_SRV_MODE, false),
         serverUrl           = prefs.getString(K_SRV_URL, "") ?: "",
@@ -116,12 +131,27 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
         .putInt(K_POLL,         c.pollIntervalSeconds)
         .apply()
 
+    private fun loadSensorVisibility() = SensorVisibility(
+        showVoltage = prefs.getBoolean(K_SHOW_VOLTAGE, true),
+        showCurrent = prefs.getBoolean(K_SHOW_CURRENT, true),
+        showWater   = prefs.getBoolean(K_SHOW_WATER,   true)
+    )
+
+    private fun saveSensorVisibility(v: SensorVisibility) = prefs.edit()
+        .putBoolean(K_SHOW_VOLTAGE, v.showVoltage)
+        .putBoolean(K_SHOW_CURRENT, v.showCurrent)
+        .putBoolean(K_SHOW_WATER,   v.showWater)
+        .apply()
+
     companion object {
-        private const val PREFS      = "mdc_prefs"
-        private const val K_IP       = "ip"
-        private const val K_PORT     = "port"
-        private const val K_SRV_MODE = "server_mode"
-        private const val K_SRV_URL  = "server_url"
-        private const val K_POLL     = "poll_sec"
+        private const val PREFS           = "mdc_prefs"
+        private const val K_IP            = "ip"
+        private const val K_PORT          = "port"
+        private const val K_SRV_MODE      = "server_mode"
+        private const val K_SRV_URL       = "server_url"
+        private const val K_POLL          = "poll_sec"
+        private const val K_SHOW_VOLTAGE  = "show_voltage"
+        private const val K_SHOW_CURRENT  = "show_current"
+        private const val K_SHOW_WATER    = "show_water"
     }
 }

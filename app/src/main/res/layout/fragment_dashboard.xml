@@ -6,8 +6,8 @@
     android:layout_height="match_parent"
     android:background="?attr/colorSurface">
 
-    <!-- ── Top App Bar ────────────────────────────────────────── -->
     <com.google.android.material.appbar.AppBarLayout
+        android:id="@+id/appBarLayout"
         android:layout_width="match_parent"
         android:layout_height="wrap_content">
 
@@ -20,7 +20,6 @@
             app:navigationIcon="@null" />
     </com.google.android.material.appbar.AppBarLayout>
 
-    <!-- ── Scrollable body ───────────────────────────────────── -->
     <androidx.core.widget.NestedScrollView
         android:layout_width="match_parent"
         android:layout_height="match_parent"
@@ -33,7 +32,7 @@
             android:padding="16dp"
             android:clipToPadding="false">
 
-            <!-- ── Status + Control card (always shown) ──────── -->
+            <!-- ── Status + Control card ──────────────────────── -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -60,12 +59,15 @@
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:text="Connecting…"
-                            app:chipMinHeight="28dp"
-                            style="@style/Widget.Material3.Chip.Suggestion"
                             android:clickable="false"
-                            android:focusable="false" />
+                            android:focusable="false"
+                            app:chipMinHeight="28dp"
+                            style="@style/Widget.Material3.Chip.Suggestion" />
 
-                        <Space android:layout_width="0dp" android:layout_height="1dp" android:layout_weight="1"/>
+                        <Space
+                            android:layout_width="0dp"
+                            android:layout_height="1dp"
+                            android:layout_weight="1" />
 
                         <TextView
                             android:id="@+id/lastUpdatedText"
@@ -97,7 +99,7 @@
                         android:text="○ MOTOR OFF"
                         android:layout_marginBottom="12dp" />
 
-                    <!-- Progress bar (shown during command) -->
+                    <!-- Progress (during command) -->
                     <com.google.android.material.progressindicator.LinearProgressIndicator
                         android:id="@+id/progressBar"
                         android:layout_width="match_parent"
@@ -141,21 +143,21 @@
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- ── MODULE A: Power Sensors container ─────────── -->
+            <!-- MODULE A — Voltage container -->
             <FrameLayout
-                android:id="@+id/modulePowerContainer"
+                android:id="@+id/moduleVoltageContainer"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginBottom="12dp" />
 
-            <!-- ── MODULE B: Vibration container ─────────────── -->
+            <!-- MODULE B — Current container -->
             <FrameLayout
-                android:id="@+id/moduleVibrationContainer"
+                android:id="@+id/moduleCurrentContainer"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginBottom="12dp" />
 
-            <!-- ── MODULE C: Water Flow container ────────────── -->
+            <!-- MODULE C — Water container -->
             <FrameLayout
                 android:id="@+id/moduleWaterContainer"
                 android:layout_width="match_parent"

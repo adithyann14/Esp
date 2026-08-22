@@ -1,7 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
-    // kotlin-android is NOT applied here — AGP 9.0+ bundles Kotlin support natively.
-    // Adding it explicitly causes a fatal build error. See: https://kotl.in/gradle/agp-built-in-kotlin
+    // kotlin-android is NOT applied — AGP 9.0+ bundles Kotlin natively.
+    // Applying it explicitly throws a fatal error. See: https://kotl.in/gradle/agp-built-in-kotlin
     alias(libs.plugins.navigation.safeargs)
 }
 
@@ -18,20 +18,21 @@ android {
         versionName   = "1.0"
     }
 
-    // Use explicit compileOptions + kotlinOptions instead of java { toolchain { } }.
-    // The toolchain block outside android { } can misfire with AGP 9's built-in Kotlin.
+    // kotlinOptions { jvmTarget } is provided by the kotlin-android plugin which
+    // cannot be applied on AGP 9.0+ (fatal error). compileOptions alone is enough —
+    // AGP 9.0+ automatically mirrors targetCompatibility to the Kotlin JVM target.
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-    kotlinOptions {
-        jvmTarget = "17"
     }
 
     buildTypes {
         getByName("release") {
             isMinifyEnabled = false
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- MODULE A — 3-Phase Voltage + Current
-     Disable: set FeatureConfig.ENABLE_POWER_SENSORS = false  -->
+<!-- MODULE A — 3-Phase Voltages
+     Disable: set FeatureConfig.ENABLE_VOLTAGE_SENSORS = false -->
 <com.google.android.material.card.MaterialCardView
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
@@ -15,11 +15,10 @@
         android:orientation="vertical"
         android:padding="16dp">
 
-        <!-- Header -->
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="⚡  Phase Voltages &amp; Current"
+            android:text="⚡  Phase Voltages"
             android:textAppearance="?attr/textAppearanceTitleSmall"
             android:textColor="?attr/colorOnSurface"
             android:layout_marginBottom="12dp" />
@@ -95,35 +94,6 @@
                 android:layout_height="wrap_content"
                 android:text="—"
                 android:textAppearance="?attr/textAppearanceTitleMedium"
-                android:fontFamily="monospace" />
-        </LinearLayout>
-
-        <com.google.android.material.divider.MaterialDivider
-            android:layout_width="match_parent"
-            android:layout_height="1dp"
-            android:layout_marginBottom="4dp"
-            app:dividerInsetStart="0dp"
-            app:dividerInsetEnd="0dp" />
-
-        <!-- Current -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="48dp"
-            android:orientation="horizontal"
-            android:gravity="center_vertical">
-            <TextView
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="Current  (A)"
-                android:textAppearance="?attr/textAppearanceBodyMedium"
-                android:textColor="?attr/colorOnSurfaceVariant" />
-            <TextView
-                android:id="@+id/valueCurrent"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="—"
-                android:textAppearance="?attr/textAppearanceTitleLarge"
                 android:fontFamily="monospace" />
         </LinearLayout>
 

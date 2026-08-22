@@ -7,7 +7,8 @@
         <item name="colorOnPrimaryContainer">#CBE9ED</item>
         <item name="colorSecondary">#A8C4D8</item>
         <item name="colorOnSecondary">#0F2940</item>
-        <item name="android:statusBarColor">?attr/colorSurface</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">?attr/colorSurface</item>
+        <item name="android:windowLightStatusBar">false</item>
     </style>
 </resources>

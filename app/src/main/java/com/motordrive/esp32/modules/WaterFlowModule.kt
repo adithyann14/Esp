@@ -1,5 +1,6 @@
 package com.motordrive.esp32.modules
 
+import android.content.res.ColorStateList
 import android.view.View
 import com.google.android.material.color.MaterialColors
 import com.motordrive.esp32.data.MotorState
@@ -7,13 +8,9 @@ import com.motordrive.esp32.databinding.ModuleWaterFlowBinding
 
 /**
  * MODULE C — Water Flow Sensor (Pipe End)
- *
- * A flow/contact sensor is connected via a long wire from the ESP32 receiver
- * and placed at the far end of the discharge pipe. This confirms that water
- * is actually coming out — the motor may be running but the pipe could be
- * blocked, dry, or the pump could be airbound.
- *
  * To DISABLE: set FeatureConfig.ENABLE_WATER_FLOW = false
+ *
+ * Same R.attr split as VibrationModule — see note there.
  */
 class WaterFlowModule(view: View) {
 
@@ -21,6 +18,7 @@ class WaterFlowModule(view: View) {
 
     fun update(state: MotorState) {
         val flowing = state.waterFlowing
+
         b.waterStatusText.text = when (flowing) {
             true  -> "Water Flowing"
             false -> "No Water Flow"
@@ -31,13 +29,14 @@ class WaterFlowModule(view: View) {
             false -> "No discharge — check pump / pipe"
             null  -> "Sensor not connected or not responding"
         }
+
         val colorAttr = when (flowing) {
-            true  -> com.google.android.material.R.attr.colorPrimary
-            false -> com.google.android.material.R.attr.colorError
+            true  -> androidx.appcompat.R.attr.colorPrimary
+            false -> androidx.appcompat.R.attr.colorError
             null  -> com.google.android.material.R.attr.colorOutline
         }
-        val color = MaterialColors.getColor(b.root, colorAttr)
-        b.waterIcon.imageTintList = android.content.res.ColorStateList.valueOf(color)
+        val color = MaterialColors.getColor(b.root, colorAttr, 0)
+        b.waterIcon.imageTintList = ColorStateList.valueOf(color)
         b.waterStatusText.setTextColor(color)
     }
 }
