@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Motor Drive</string>
+    <string name="motor_on">MOTOR  ON</string>
+    <string name="motor_off">MOTOR  OFF</string>
+</resources>
