@@ -7,30 +7,33 @@ import com.motordrive.esp32.data.MotorState
 import com.motordrive.esp32.databinding.ModuleWaterFlowBinding
 
 /**
- * MODULE C — Water Flow Sensor (Pipe End)
- * To DISABLE: set FeatureConfig.ENABLE_WATER_FLOW = false
+ * MODULE C — Pipe-end water sensor.
  *
- * Same R.attr split as VibrationModule — see note there.
+ * Sensor is active-LOW (conducting = water detected = digital LOW on D2).
+ * The receiver ESP sets waterDetected=true in its status packet when it reads LOW.
+ * Cut-off logic (30 s no-water) runs on the receiver, not here.
+ *
+ * To DISABLE: set FeatureConfig.ENABLE_WATER_FLOW = false
  */
 class WaterFlowModule(view: View) {
 
     private val b = ModuleWaterFlowBinding.bind(view)
 
     fun update(state: MotorState) {
-        val flowing = state.waterFlowing
+        val detected = state.waterDetected   // true = water at pipe end
 
-        b.waterStatusText.text = when (flowing) {
-            true  -> "Water Flowing"
-            false -> "No Water Flow"
+        b.waterStatusText.text = when (detected) {
+            true  -> "Water Detected"
+            false -> "No Water"
             null  -> "No Data"
         }
-        b.waterSubtext.text = when (flowing) {
-            true  -> "Discharge detected at pipe end"
-            false -> "No discharge — check pump / pipe"
+        b.waterSubtext.text = when (detected) {
+            true  -> "Flow confirmed at pipe end"
+            false -> "No flow at pipe end — motor auto-off in 30 s"
             null  -> "Sensor not connected or not responding"
         }
 
-        val colorAttr = when (flowing) {
+        val colorAttr = when (detected) {
             true  -> androidx.appcompat.R.attr.colorPrimary
             false -> androidx.appcompat.R.attr.colorError
             null  -> com.google.android.material.R.attr.colorOutline

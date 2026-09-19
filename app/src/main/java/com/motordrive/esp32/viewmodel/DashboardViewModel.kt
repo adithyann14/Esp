@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.motordrive.esp32.AppLogger
 import com.motordrive.esp32.data.ConnectionConfig
 import com.motordrive.esp32.data.Esp32Repository
 import com.motordrive.esp32.data.MotorState
@@ -16,8 +17,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Which sensor cards the user wants visible at runtime.
- * Saved to prefs immediately when any toggle changes — no Save button needed.
+ * Which sensor cards the user wants visible on the dashboard.
+ * Saved to SharedPreferences immediately when a toggle changes.
  */
 data class SensorVisibility(
     val showVoltage: Boolean = true,   // MODULE A
@@ -29,7 +30,7 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
 
     private val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
-    // ── Public state ──────────────────────────────────────────────
+    // ── Public state ──────────────────────────────────────────────────────
     private val _motorState = MutableStateFlow(MotorState())
     val motorState: StateFlow<MotorState> = _motorState.asStateFlow()
 
@@ -45,10 +46,17 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
     private val _pendingAlerts = MutableStateFlow<List<PendingAlert>>(emptyList())
     val pendingAlerts: StateFlow<List<PendingAlert>> = _pendingAlerts.asStateFlow()
 
-    // ── Polling ───────────────────────────────────────────────────
+    /** Lines fetched from the ESP sender's /api/logs endpoint. */
+    private val _espLogs = MutableStateFlow<List<String>>(emptyList())
+    val espLogs: StateFlow<List<String>> = _espLogs.asStateFlow()
+
+    // ── Polling ───────────────────────────────────────────────────────────
     private var pollJob: Job? = null
 
-    init { startPolling() }
+    init {
+        AppLogger.log("VM", "ViewModel started")
+        startPolling()
+    }
 
     fun startPolling() {
         pollJob?.cancel()
@@ -64,30 +72,72 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun poll() {
         repo().getStatus()
-            .onSuccess { _motorState.value = it }
+            .onSuccess { new ->
+                val prev = _motorState.value
+                _motorState.value = new
+
+                // Log meaningful state transitions for the in-app logcat
+                if (!prev.isConnected && new.isConnected)
+                    AppLogger.log("CONN", "Connected to ESP8266 at ${_config.value.baseUrl}")
+                if (prev.isConnected && !new.isConnected)
+                    AppLogger.log("CONN", "Lost connection to ESP8266")
+                if (prev.motorOn != new.motorOn)
+                    AppLogger.log("MOTOR", "State changed → ${if (new.motorOn) "ON" else "OFF"}")
+                if (prev.waterDetected != new.waterDetected && new.waterDetected != null)
+                    AppLogger.log("WATER", "Detection → ${if (new.waterDetected) "WATER" else "DRY"}")
+                if (prev.espNowConnected != new.espNowConnected)
+                    AppLogger.log("ESP-NOW", "RF link ${if (new.espNowConnected) "UP ✓" else "DOWN ✗"}")
+            }
             .onFailure { err ->
+                val msg = err.message ?: "Connection failed"
+                if (_motorState.value.isConnected)
+                    AppLogger.log("CONN", "Poll error: $msg")
                 _motorState.value = _motorState.value.copy(
                     isConnected  = false,
-                    errorMessage = err.message ?: "Connection failed"
+                    errorMessage = msg
                 )
             }
 
         repo().getAlerts()
-            .onSuccess { alerts -> if (alerts.isNotEmpty()) _pendingAlerts.value = alerts }
+            .onSuccess { alerts ->
+                if (alerts.isNotEmpty()) _pendingAlerts.value = alerts
+            }
     }
 
-    // ── Commands ──────────────────────────────────────────────────
+    /**
+     * Fetch the ESP serial log ring-buffer and update [espLogs].
+     * Call this from SettingsFragment when the user taps "Refresh" in the
+     * Serial Monitor panel. Non-blocking; runs on IO dispatcher.
+     */
+    suspend fun fetchLogs() {
+        AppLogger.log("LOGS", "Fetching /api/logs …")
+        repo().getLogs()
+            .onSuccess { lines ->
+                _espLogs.value = lines
+                AppLogger.log("LOGS", "ESP log: ${lines.size} line(s)")
+            }
+            .onFailure { err ->
+                AppLogger.log("LOGS", "Error: ${err.message}")
+            }
+    }
+
+    // ── Commands ──────────────────────────────────────────────────────────
     fun motorOn()  = sendCmd(true)
     fun motorOff() = sendCmd(false)
 
     private fun sendCmd(on: Boolean) = viewModelScope.launch {
         if (_isLoading.value) return@launch
         _isLoading.value = true
+        AppLogger.log("MOTOR", "Sending: ${if (on) "ON" else "OFF"}")
         val result = if (on) repo().motorOn() else repo().motorOff()
-        if (result.isSuccess) { delay(400); poll() }
-        else _motorState.value = _motorState.value.copy(
-            errorMessage = result.exceptionOrNull()?.message ?: "Command failed"
-        )
+        if (result.isSuccess) {
+            delay(400)
+            poll()
+        } else {
+            val msg = result.exceptionOrNull()?.message ?: "Command failed"
+            AppLogger.log("MOTOR", "Command failed: $msg")
+            _motorState.value = _motorState.value.copy(errorMessage = msg)
+        }
         _isLoading.value = false
     }
 
@@ -98,23 +148,23 @@ class DashboardViewModel(app: Application) : AndroidViewModel(app) {
         _pendingAlerts.value = emptyList()
     }
 
-    // ── Settings ──────────────────────────────────────────────────
+    // ── Settings ──────────────────────────────────────────────────────────
     fun updateConfig(cfg: ConnectionConfig) {
+        AppLogger.log("CONN", "Config → ${cfg.baseUrl}")
         _config.value = cfg
         saveConfig(cfg)
         startPolling()
     }
 
-    /** Called immediately when a sensor toggle changes — no Save needed. */
     fun updateSensorVisibility(v: SensorVisibility) {
         _sensorVisibility.value = v
         saveSensorVisibility(v)
     }
 
-    // ── Helpers ───────────────────────────────────────────────────
+    // ── Helpers ────────────────────────────────────────────────────────────
     private fun repo() = Esp32Repository(_config.value)
 
-    // ── Persistence ───────────────────────────────────────────────
+    // ── Persistence ────────────────────────────────────────────────────────
     private fun loadConfig() = ConnectionConfig(
         directIp            = prefs.getString(K_IP, "192.168.4.1") ?: "192.168.4.1",
         port                = prefs.getInt(K_PORT, 80),

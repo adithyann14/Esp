@@ -1,0 +1,341 @@
+/**
+ * ════════════════════════════════════════════════════════════════════════
+ *  SENDER  —  NodeMCU ESP8266  (board: NodeMCU 1.0 / ESP-12E)
+ *
+ *  ── What changed in this revision ────────────────────────────────────
+ *  • Edge-detection debounce: exactly ONE command per physical press,
+ *    no matter how long button is held (was firing every 50 ms while held)
+ *  • Link-lost detection: if no status from receiver for 10 s →
+ *    builtin LED rapid-blinks and linkOk=false in JSON
+ *  • g_motorOn fully synced from receiver status (ground truth) — LEDs
+ *    only update when receiver confirms, so green = motor truly running
+ *  • Extended status JSON: waterOk, stall, linkOk fields added
+ *  • Stall warning printed on serial when receiver reports stall
+ *  • Boot blink 2× alternating = sender identifier (receiver is 3×)
+ *  • ESP-NOW init: 3 retries before reboot (was instant reboot)
+ *  • updateLEDs() only called on g_motorOn state change — no wasteful
+ *    digitalWrite every loop iteration
+ * ════════════════════════════════════════════════════════════════════════
+ */
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+
+extern "C" {
+  #include <espnow.h>
+  #include <user_interface.h>
+}
+
+// ── LoRa SX1278 — DEAD CODE ─────────────────────────────────────────────
+// #include <SPI.h>
+// #include <LoRa.h>
+// #define LORA_RST   D0   // GPIO16
+// #define LORA_DIO0  D4   // GPIO2
+// #define LORA_SCK   D5   // GPIO14
+// #define LORA_MISO  D6   // GPIO12
+// #define LORA_MOSI  D7   // GPIO13
+// #define LORA_NSS   D8   // GPIO15
+// #define LORA_FREQ  433E6
+// ─────────────────────────────────────────────────────────────────────────
+
+// ── Pin definitions ───────────────────────────────────────────────────────
+#define PIN_BTN_ON      D1      // GPIO5  — Button ON  → GND, INPUT_PULLUP
+#define PIN_BTN_OFF     D2      // GPIO4  — Button OFF → GND, INPUT_PULLUP
+#define PIN_LED_ON      D3      // GPIO0  — Green LED + 220 Ω (motor ON)
+#define PIN_LED_OFF     3       // GPIO3/RX — Red LED + 220 Ω (motor OFF)
+#define PIN_BUILTIN_LED 2       // GPIO2  — Builtin LED, active LOW
+
+// ── Wi-Fi AP ──────────────────────────────────────────────────────────────
+static const char*   AP_SSID = "MotorControl";
+static const char*   AP_PASS = "motor1234";
+static const uint8_t WIFI_CH = 1;
+
+// ── ESP-NOW broadcast ─────────────────────────────────────────────────────
+static uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+// Command packet  Sender → Receiver
+typedef struct __attribute__((packed)) {
+  uint8_t  type;   // 0x01
+  uint8_t  cmd;    // 0x01=ON  0x02=OFF
+  uint32_t seq;
+} CmdPacket;
+
+// Status packet  Receiver → Sender  (must match receiver's definition)
+typedef struct __attribute__((packed)) {
+  uint8_t  type;
+  float    current;
+  uint8_t  motorOn;
+  uint8_t  waterOk;
+  uint8_t  stall;
+  uint32_t seq;
+} StatusPacket;
+
+// ── State (updated from receiver status packets) ──────────────────────────
+static volatile bool  g_motorOn  = false;
+static volatile float g_currentA = 0.0f;
+static volatile bool  g_waterOk  = true;
+static volatile bool  g_stall    = false;
+static uint32_t       g_cmdSeq   = 0;
+
+// ── Link-lost detection ───────────────────────────────────────────────────
+static volatile bool  g_rxFlag        = false;
+static unsigned long  g_lastStatusRxMs = 0;
+static bool           g_linkLost      = false;
+#define LINK_TIMEOUT_MS  10000UL
+#define BLINK_MS           150UL
+
+static unsigned long  g_blinkUntil = 0;
+
+// ── LED state tracking (update only on change, not every loop) ────────────
+static bool g_prevMotorOn = false;
+
+// ── Edge-detection debounce ───────────────────────────────────────────────
+//   Fires exactly once per physical button press, regardless of hold time
+static bool          g_prevBtnOn   = HIGH;
+static bool          g_prevBtnOff  = HIGH;
+static unsigned long g_btnOnEdge   = 0;
+static unsigned long g_btnOffEdge  = 0;
+static bool          g_btnOnArmed  = false;
+static bool          g_btnOffArmed = false;
+#define DEBOUNCE_MS 50UL
+
+// ── Stall alert edge (warn once per stall event, not every loop) ──────────
+static bool g_prevStall = false;
+
+// ── HTTP server ───────────────────────────────────────────────────────────
+static ESP8266WebServer server(80);
+
+// ═════════════════════════════════════════════════════════════════════════
+//  LED helper
+// ═════════════════════════════════════════════════════════════════════════
+
+static void updateLEDs() {
+  digitalWrite(PIN_LED_ON,  g_motorOn ? HIGH : LOW);
+  digitalWrite(PIN_LED_OFF, g_motorOn ? LOW  : HIGH);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Motor command — sends 3× with 12 ms spacing, seq-deduped on receiver
+// ═════════════════════════════════════════════════════════════════════════
+
+static void sendMotorCommand(bool on) {
+  CmdPacket pkt;
+  memset(&pkt, 0, sizeof(pkt));
+  pkt.type = 0x01;
+  pkt.cmd  = on ? 0x01 : 0x02;
+  pkt.seq  = ++g_cmdSeq;
+
+  for (uint8_t i = 0; i < 3; i++) {
+    esp_now_send(BCAST_MAC, (uint8_t*)&pkt, sizeof(pkt));
+    delay(12);
+  }
+
+  Serial.printf("[SENDER] sent cmd=%s  seq=%lu\n",
+    on ? "ON" : "OFF", (unsigned long)g_cmdSeq);
+  // Note: g_motorOn is NOT set here — LEDs update when receiver confirms
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  ESP-NOW callbacks — flags ONLY inside callbacks
+// ═════════════════════════════════════════════════════════════════════════
+
+void espnowOnSend(uint8_t* /*mac*/, uint8_t /*status*/) { }
+
+void espnowOnRecv(uint8_t* /*mac*/, uint8_t* data, uint8_t len) {
+  if (len < 1) return;
+  g_rxFlag = true;   // consumed in loop to update g_lastStatusRxMs
+
+  if (data[0] == 0x02 && len >= sizeof(StatusPacket)) {
+    StatusPacket pkt;
+    memcpy(&pkt, data, sizeof(pkt));
+    // Receiver is ground truth for all state
+    g_motorOn  = pkt.motorOn;
+    g_currentA = pkt.current;
+    g_waterOk  = pkt.waterOk;
+    g_stall    = pkt.stall;
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  HTTP handlers
+// ═════════════════════════════════════════════════════════════════════════
+
+static String buildStatusJson() {
+  String j = "{";
+  j += "\"motorOn\":"   + String(g_motorOn  ? "true" : "false") + ",";
+  j += "\"current\":"   + String(g_currentA, 2)                 + ",";
+  j += "\"isRunning\":" + String(g_motorOn  ? "true" : "false") + ",";
+  j += "\"waterOk\":"   + String(g_waterOk  ? "true" : "false") + ",";
+  j += "\"stall\":"     + String(g_stall    ? "true" : "false") + ",";
+  j += "\"linkOk\":"    + String(!g_linkLost ? "true" : "false");
+  j += "}";
+  return j;
+}
+
+static void addCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin",  "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+void handleStatus()      { addCorsHeaders(); server.send(200, "application/json", buildStatusJson()); }
+void handleMotorOn()     { sendMotorCommand(true);  addCorsHeaders(); server.send(200, "application/json", "{\"success\":true}"); }
+void handleMotorOff()    { sendMotorCommand(false); addCorsHeaders(); server.send(200, "application/json", "{\"success\":true}"); }
+void handleAlerts()      { addCorsHeaders(); server.send(200, "application/json", "{\"alerts\":[]}"); }
+void handleAlertsClear() { addCorsHeaders(); server.send(200, "application/json", "{\"success\":true}"); }
+void handleOptions()     { addCorsHeaders(); server.send(204); }
+void handleNotFound()    { server.send(404, "application/json", "{\"error\":\"not found\"}"); }
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Setup
+// ═════════════════════════════════════════════════════════════════════════
+
+void setup() {
+  Serial.begin(115200, SERIAL_8N1, SERIAL_TX_ONLY);
+  delay(100);
+  Serial.println("\n[SENDER] boot");
+
+  // ── GPIO ──────────────────────────────────────────────────────────────
+  pinMode(PIN_BTN_ON,      INPUT_PULLUP);
+  pinMode(PIN_BTN_OFF,     INPUT_PULLUP);
+  pinMode(PIN_LED_ON,      OUTPUT);
+  pinMode(PIN_LED_OFF,     OUTPUT);
+  pinMode(PIN_BUILTIN_LED, OUTPUT);
+  digitalWrite(PIN_BUILTIN_LED, HIGH);  // off (active LOW)
+  // Boot default: motor off = red on, green off
+  digitalWrite(PIN_LED_ON,  LOW);
+  digitalWrite(PIN_LED_OFF, HIGH);
+
+  // ── Boot blink: 2× alternating = sender identifier (receiver is 3×) ──
+  for (int i = 0; i < 2; i++) {
+    digitalWrite(PIN_LED_ON, HIGH); digitalWrite(PIN_LED_OFF, LOW);
+    delay(200);
+    digitalWrite(PIN_LED_ON, LOW);  digitalWrite(PIN_LED_OFF, HIGH);
+    delay(200);
+  }
+
+  // ── Wi-Fi AP ──────────────────────────────────────────────────────────
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS, WIFI_CH);
+  WiFi.setOutputPower(20.5f);
+  wifi_set_phy_mode(PHY_MODE_11B);    // 802.11b = longest range
+  Serial.print("[SENDER] AP up  IP=");
+  Serial.println(WiFi.softAPIP());
+
+  // ── ESP-NOW init with 3 retries ───────────────────────────────────────
+  int tries = 3;
+  while (esp_now_init() != 0 && tries-- > 0) {
+    Serial.println("[SENDER] ESP-NOW init failed — retrying...");
+    delay(500);
+  }
+  if (tries < 0) {
+    Serial.println("[SENDER] ESP-NOW FAILED 3× — rebooting");
+    delay(1000); ESP.restart();
+  }
+  esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+  esp_now_register_send_cb(espnowOnSend);
+  esp_now_register_recv_cb(espnowOnRecv);
+  esp_now_add_peer(BCAST_MAC, ESP_NOW_ROLE_COMBO, WIFI_CH, nullptr, 0);
+  Serial.println("[SENDER] ESP-NOW ready (broadcast)");
+
+  // ── LoRa DEAD CODE ────────────────────────────────────────────────────
+  // LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
+  // if (!LoRa.begin(LORA_FREQ)) Serial.println("LoRa init failed");
+
+  // ── HTTP routes ───────────────────────────────────────────────────────
+  server.on("/api/status",       HTTP_GET,     handleStatus);
+  server.on("/api/motor/on",     HTTP_POST,    handleMotorOn);
+  server.on("/api/motor/off",    HTTP_POST,    handleMotorOff);
+  server.on("/api/alerts",       HTTP_GET,     handleAlerts);
+  server.on("/api/alerts/clear", HTTP_POST,    handleAlertsClear);
+  server.on("/api/status",       HTTP_OPTIONS, handleOptions);
+  server.on("/api/motor/on",     HTTP_OPTIONS, handleOptions);
+  server.on("/api/motor/off",    HTTP_OPTIONS, handleOptions);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("[SENDER] HTTP server ready");
+  Serial.println("[SENDER] AP=MotorControl  pass=motor1234");
+  Serial.println("[SENDER] ready — waiting for receiver status...");
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Main loop
+// ═════════════════════════════════════════════════════════════════════════
+
+void loop() {
+  server.handleClient();
+  unsigned long now = millis();
+
+  // ── Consume rxFlag — must happen in loop, not callback ────────────────
+  if (g_rxFlag) {
+    g_rxFlag         = false;
+    g_lastStatusRxMs = now;
+    g_linkLost       = false;
+    g_blinkUntil     = now + BLINK_MS;
+    digitalWrite(PIN_BUILTIN_LED, LOW);    // blink on
+  }
+
+  // ── Link-lost: no status packet for 10 s ─────────────────────────────
+  if (g_lastStatusRxMs > 0 && (now - g_lastStatusRxMs > LINK_TIMEOUT_MS)) {
+    if (!g_linkLost) {
+      g_linkLost = true;
+      Serial.println("[SENDER] ⚠ LINK LOST — no status from receiver for 10 s");
+    }
+  }
+
+  // ── Builtin LED behaviour ─────────────────────────────────────────────
+  if (g_linkLost) {
+    // Rapid alternating blink every 200 ms while link is down
+    digitalWrite(PIN_BUILTIN_LED, ((now / 200) % 2 == 0) ? LOW : HIGH);
+  } else if (now < g_blinkUntil) {
+    digitalWrite(PIN_BUILTIN_LED, LOW);    // brief on after packet
+  } else {
+    digitalWrite(PIN_BUILTIN_LED, HIGH);   // off
+  }
+
+  // ── Sync ext LEDs from receiver state (only on change) ───────────────
+  if ((bool)g_motorOn != g_prevMotorOn) {
+    g_prevMotorOn = g_motorOn;
+    updateLEDs();
+    Serial.printf("[SENDER] motor state → %s\n", g_motorOn ? "ON" : "OFF");
+  }
+
+  // ── Stall warning — print once per stall event ────────────────────────
+  if (g_stall && !g_prevStall) {
+    Serial.println("[SENDER] ⚠ STALL reported by receiver");
+  }
+  g_prevStall = g_stall;
+
+  // ── Buttons — edge detection, fires exactly once per press ───────────
+  bool curBtnOn  = digitalRead(PIN_BTN_ON);
+  bool curBtnOff = digitalRead(PIN_BTN_OFF);
+
+  // ON button ────────────────────────────────────────────────────────────
+  if (curBtnOn == LOW && g_prevBtnOn == HIGH) {
+    // Falling edge detected — start debounce timer
+    g_btnOnEdge  = now;
+    g_btnOnArmed = true;
+  }
+  if (g_btnOnArmed && curBtnOn == LOW && (now - g_btnOnEdge >= DEBOUNCE_MS)) {
+    // Debounce settled — fire exactly once
+    g_btnOnArmed = false;
+    Serial.println("[SENDER] BTN ON pressed");
+    sendMotorCommand(true);
+  }
+  if (curBtnOn == HIGH) g_btnOnArmed = false;   // released before debounce settled
+  g_prevBtnOn = curBtnOn;
+
+  // OFF button ───────────────────────────────────────────────────────────
+  if (curBtnOff == LOW && g_prevBtnOff == HIGH) {
+    g_btnOffEdge  = now;
+    g_btnOffArmed = true;
+  }
+  if (g_btnOffArmed && curBtnOff == LOW && (now - g_btnOffEdge >= DEBOUNCE_MS)) {
+    g_btnOffArmed = false;
+    Serial.println("[SENDER] BTN OFF pressed");
+    sendMotorCommand(false);
+  }
+  if (curBtnOff == HIGH) g_btnOffArmed = false;
+  g_prevBtnOff = curBtnOff;
+}

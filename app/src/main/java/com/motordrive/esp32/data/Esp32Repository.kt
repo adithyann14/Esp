@@ -8,15 +8,18 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * All HTTP calls to the ESP8266 (or server proxy).
- * Uses only HttpURLConnection — no extra dependencies.
+ * All HTTP calls to the ESP8266 sender (or server proxy).
+ * Uses HttpURLConnection only — no extra dependencies.
  *
- * ── ESP8266 Arduino endpoints ────────────────────────────────────────────
+ * ── ESP8266 endpoints ────────────────────────────────────────────────────
  *
- *  GET  /api/status          → { "motorOn": bool, "voltageR": f, "voltageY": f,
- *                                "voltageB": f, "current": f, "waterFlow": bool }
+ *  GET  /api/status
+ *       → { "motorOn": bool, "current": f, "isRunning": bool,
+ *           "waterDetected": bool, "espNowConnected": bool }
+ *
  *  POST /api/motor/on        → { "success": true }
  *  POST /api/motor/off       → { "success": true }
+ *  GET  /api/logs            → { "logs": ["line1", "line2", ...] }
  *  GET  /api/alerts          → { "alerts": [] }
  *  POST /api/alerts/clear    → { "success": true }
  * ─────────────────────────────────────────────────────────────────────────
@@ -47,7 +50,24 @@ class Esp32Repository(private val config: ConnectionConfig) {
         Unit
     }
 
-    // ── HTTP helpers ──────────────────────────────────────────────────────
+    /**
+     * Fetch the ESP sender's serial log ring-buffer (GET /api/logs).
+     * Returns an empty list gracefully if the endpoint doesn't exist (older firmware).
+     */
+    suspend fun getLogs(): Result<List<String>> = io {
+        try {
+            val json = httpGet("${config.baseUrl}/api/logs")
+            val arr = JSONObject(json).optJSONArray("logs") ?: return@io emptyList()
+            (0 until arr.length())
+                .map { arr.optString(it, "").trim() }
+                .filter { it.isNotBlank() }
+        } catch (_: IOException) {
+            // Older firmware without /api/logs — return empty list, don't throw
+            emptyList()
+        }
+    }
+
+    // ── HTTP primitives ───────────────────────────────────────────────────
     private suspend fun <T> io(block: () -> T): Result<T> =
         withContext(Dispatchers.IO) { runCatching(block) }
 
@@ -87,15 +107,16 @@ class Esp32Repository(private val config: ConnectionConfig) {
     private fun parseStatus(json: String): MotorState {
         val o = JSONObject(json)
         return MotorState(
-            motorOn      = o.optBoolean("motorOn", false),
-            voltageR     = o.floatOrNull("voltageR"),
-            voltageY     = o.floatOrNull("voltageY"),
-            voltageB     = o.floatOrNull("voltageB"),
-            current      = o.floatOrNull("current"),
-            waterFlowing = o.boolOrNull("waterFlow"),
-            isConnected  = true,
-            lastUpdatedMs = System.currentTimeMillis(),
-            errorMessage = null
+            motorOn         = o.optBoolean("motorOn", false),
+            voltageR        = o.floatOrNull("voltageR"),
+            voltageY        = o.floatOrNull("voltageY"),
+            voltageB        = o.floatOrNull("voltageB"),
+            current         = o.floatOrNull("current"),
+            waterDetected   = o.boolOrNull("waterDetected"),   // ← new key (was "waterFlow")
+            espNowConnected = o.optBoolean("espNowConnected", false),
+            isConnected     = true,
+            lastUpdatedMs   = System.currentTimeMillis(),
+            errorMessage    = null
         )
     }
 
@@ -104,13 +125,14 @@ class Esp32Repository(private val config: ConnectionConfig) {
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             PendingAlert(
-                type      = o.optString("type", "unknown"),
-                timestamp = o.optLong("timestamp", 0L),
-                message   = o.optString("message", "Unknown event")
+                type      = o.optString("type",      "unknown"),
+                timestamp = o.optLong("timestamp",   0L),
+                message   = o.optString("message",   "Unknown event")
             )
         }
     }
 
+    // ── Extension helpers ─────────────────────────────────────────────────
     private fun JSONObject.floatOrNull(key: String): Float? {
         if (!has(key) || isNull(key)) return null
         val d = optDouble(key, Double.NaN)

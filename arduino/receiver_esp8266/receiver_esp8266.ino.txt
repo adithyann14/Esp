@@ -1,0 +1,463 @@
+/**
+ * ════════════════════════════════════════════════════════════════════════
+ *  RECEIVER  —  NodeMCU ESP8266  (board: NodeMCU 1.0 / ESP-12E)
+ *
+ *  ── What changed in this revision ────────────────────────────────────
+ *  • RELAY fires ONLY after servo physically holds at 0° (ON) or 180° (OFF)
+ *    for SERVO_HOLD_MS — not simultaneously with the servo move
+ *  • ServoIntent enum: STARTING / STOPPING tracks which relay action follows
+ *  • EMA current smoothing — non-blocking 50 ms samples, no more 10 ms burst
+ *  • Stall detection: motor ON but current < threshold for 5 s → flag + serial
+ *  • Water timer starts when relay actually turns ON (not on command receive)
+ *  • Command conflict: if ON + OFF both pending simultaneously → OFF wins
+ *  • Extended status packet: adds waterOk and stall flags → sender JSON
+ *  • Immediate status broadcast on every state change (not just periodic)
+ *  • STATUS_INTERVAL reduced to 1 s (was 2 s) for tighter app sync
+ *  • ESP-NOW init: 3 retries before reboot (was instant reboot)
+ *  • Boot blink 3× = receiver identifier (sender blinks 2×)
+ *  • Boot water-sensor check reported on serial
+ *  • Servo attach uses explicit pulse range (500–2400 µs) — fixes GPIO0 quirk
+ *  • activateMotor / deactivateMotor guard both servo state AND motorOn state
+ * ════════════════════════════════════════════════════════════════════════
+ */
+
+#include <ESP8266WiFi.h>
+#include <Servo.h>
+
+extern "C" {
+  #include <espnow.h>
+  #include <user_interface.h>
+}
+
+// ── LoRa SX1278 — DEAD CODE ─────────────────────────────────────────────
+// #include <SPI.h>
+// #include <LoRa.h>
+// #define LORA_RST   D0   // GPIO16
+// #define LORA_DIO0  D4   // GPIO2
+// #define LORA_SCK   D5   // GPIO14
+// #define LORA_MISO  D6   // GPIO12
+// #define LORA_MOSI  D7   // GPIO13
+// #define LORA_NSS   D8   // GPIO15
+// #define LORA_FREQ  433E6
+// ─────────────────────────────────────────────────────────────────────────
+
+// ── Pin definitions ───────────────────────────────────────────────────────
+#define PIN_RELAY       D1    // GPIO5  — Relay IN, active HIGH (level-shifted)
+#define PIN_WATER       D2    // GPIO4  — BC547 water sensor, active LOW, 10k pull-up
+#define PIN_SERVO       D3    // GPIO0  — Servo signal  ⚠ boot pin
+// D4–D8 → LoRa dead code
+// A0    → ACS712 current sensor
+#define PIN_BUILTIN_LED 2     // GPIO2  — Builtin LED, active LOW
+
+// ── Sender AP credentials ─────────────────────────────────────────────────
+static const char*    AP_SSID       = "MotorControl";
+static const char*    AP_PASS       = "motor1234";
+static const uint8_t  WIFI_CH       = 1;
+static const uint16_t AP_TIMEOUT_MS = 10000;
+
+// ── ESP-NOW broadcast ─────────────────────────────────────────────────────
+static uint8_t BCAST_MAC[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+// Command packet  Sender → Receiver
+typedef struct __attribute__((packed)) {
+  uint8_t  type;   // 0x01
+  uint8_t  cmd;    // 0x01=ON  0x02=OFF
+  uint32_t seq;
+} CmdPacket;
+
+// Status packet  Receiver → Sender  (extended: waterOk + stall)
+typedef struct __attribute__((packed)) {
+  uint8_t  type;     // 0x02
+  float    current;  // EMA-smoothed ACS712 reading (A)
+  uint8_t  motorOn;  // relay state (1 = relay energised)
+  uint8_t  waterOk;  // 1 = water detected, or check not yet active
+  uint8_t  stall;    // 1 = motor commanded ON but no current for 5 s
+  uint32_t seq;
+} StatusPacket;
+
+// ── ACS712  (5A module, 3.3 V supply) ───────────────────────────────────
+//   Zero-current output = VCC/2 = 1.65 V
+//   Sensitivity = 185 mV/A × (3.3/5) ≈ 122 mV/A
+static const float ACS_ZERO_V         = 1.65f;
+static const float ACS_SENS_V_PER_A   = 0.122f;
+static const float CURRENT_RUN_THRESH = 0.10f;   // A — tune to your motor
+#define ACS_ALPHA    0.15f   // EMA factor: lower = smoother, slower
+#define ACS_SAMPLE_MS 50UL   // sample every 50 ms
+
+// ── Servo ─────────────────────────────────────────────────────────────────
+#define SERVO_NEUTRAL   90   // resting — no button pressed
+#define SERVO_START      0   // push START button
+#define SERVO_STOP     180   // push STOP button
+#define SERVO_HOLD_MS  600UL // time servo holds at button before relay fires
+#define SERVO_BACK_MS  400UL // time for arm to return to neutral
+
+// ── Timeouts / detection ──────────────────────────────────────────────────
+#define WATER_TIMEOUT_MS  30000UL  // 30 s after relay ON to detect water
+#define STALL_TIMEOUT_MS   5000UL  // 5 s motorOn + no current = stall
+#define BLINK_MS            150UL
+
+// ── Servo state machine ───────────────────────────────────────────────────
+enum class ServoState  : uint8_t { IDLE, PRESSING, RETURNING };
+enum class ServoIntent : uint8_t { NONE, STARTING, STOPPING  };
+
+static Servo       motorServo;
+static ServoState  servoState  = ServoState::IDLE;
+static ServoIntent servoIntent = ServoIntent::NONE;
+static unsigned long servoTimer = 0;
+
+// ── Motor / command state ─────────────────────────────────────────────────
+static volatile bool     g_pendingOn  = false;
+static volatile bool     g_pendingOff = false;
+static volatile uint32_t g_lastSeq    = 0;
+static volatile bool     g_rxFlag     = false;
+
+static bool    g_motorOn    = false;
+static uint8_t g_queuedCmd  = 0;   // 0=none  1=ON  2=OFF (saved while servo busy)
+
+// ── Water sensor ──────────────────────────────────────────────────────────
+static bool          g_waterCheckActive = false;
+static unsigned long g_waterCheckStart  = 0;
+static bool          g_waterDetected    = false;
+
+// ── ACS712 EMA ────────────────────────────────────────────────────────────
+static float         g_currentSmooth = 0.0f;
+static unsigned long g_acsLastMs     = 0;
+
+// ── Stall detection ───────────────────────────────────────────────────────
+static unsigned long g_stallTimer    = 0;
+static bool          g_stallDetected = false;
+
+// ── Status broadcast ──────────────────────────────────────────────────────
+static uint32_t      g_statusSeq    = 0;
+static unsigned long g_lastStatusMs = 0;
+#define STATUS_INTERVAL_MS 1000UL
+
+// ── Blink ─────────────────────────────────────────────────────────────────
+static unsigned long g_blinkUntil = 0;
+
+// ═════════════════════════════════════════════════════════════════════════
+//  ACS712 EMA — non-blocking, called from loop every ACS_SAMPLE_MS
+// ═════════════════════════════════════════════════════════════════════════
+
+static void updateCurrentEMA(unsigned long now) {
+  if (now - g_acsLastMs < ACS_SAMPLE_MS) return;
+  g_acsLastMs  = now;
+  float raw     = analogRead(A0);
+  float voltage = (raw / 1023.0f) * 3.3f;
+  float sample  = (voltage - ACS_ZERO_V) / ACS_SENS_V_PER_A;
+  g_currentSmooth = ACS_ALPHA * sample + (1.0f - ACS_ALPHA) * g_currentSmooth;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Status broadcast
+// ═════════════════════════════════════════════════════════════════════════
+
+static void sendStatusNow() {
+  StatusPacket pkt;
+  pkt.type    = 0x02;
+  pkt.current = g_currentSmooth;
+  pkt.motorOn = g_motorOn ? 1 : 0;
+  // waterOk = detected, OR check not active (motor off = no check needed)
+  pkt.waterOk = (g_waterDetected || !g_waterCheckActive) ? 1 : 0;
+  pkt.stall   = g_stallDetected ? 1 : 0;
+  pkt.seq     = ++g_statusSeq;
+  esp_now_send(BCAST_MAC, (uint8_t*)&pkt, sizeof(pkt));
+  g_lastStatusMs = millis();
+}
+
+static void sendStatusPeriodic(unsigned long now) {
+  if (now - g_lastStatusMs < STATUS_INTERVAL_MS) return;
+  sendStatusNow();
+  Serial.printf("[RECV] current=%.2fA  motorOn=%d  water=%s  stall=%d\n",
+    g_currentSmooth, (int)g_motorOn,
+    g_waterDetected ? "OK" : (g_waterCheckActive ? "WAITING" : "IDLE"),
+    (int)g_stallDetected);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Motor helpers — servo move only, relay fires in state machine below
+// ═════════════════════════════════════════════════════════════════════════
+
+static void activateMotor() {
+  if (servoState != ServoState::IDLE) return;  // busy — caller queued it
+  if (g_motorOn)                       return;  // already running
+  servoIntent = ServoIntent::STARTING;
+  motorServo.write(SERVO_START);
+  servoState  = ServoState::PRESSING;
+  servoTimer  = millis();
+  Serial.println("[RECV] servo → 0° (START press, relay fires after hold)");
+}
+
+static void deactivateMotor() {
+  if (servoState != ServoState::IDLE) return;
+  if (!g_motorOn)                     return;  // already off
+  servoIntent = ServoIntent::STOPPING;
+  motorServo.write(SERVO_STOP);
+  servoState  = ServoState::PRESSING;
+  servoTimer  = millis();
+  // Cancel water check immediately on stop command
+  g_waterCheckActive = false;
+  g_waterDetected    = false;
+  Serial.println("[RECV] servo → 180° (STOP press, relay cuts after hold)");
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Servo state machine — RELAY CHANGES HAPPEN HERE, not in helpers above
+// ═════════════════════════════════════════════════════════════════════════
+
+static void handleServo(unsigned long now) {
+  switch (servoState) {
+
+    case ServoState::PRESSING:
+      if (now - servoTimer >= SERVO_HOLD_MS) {
+
+        if (servoIntent == ServoIntent::STARTING) {
+          // ── Servo held at 0° for SERVO_HOLD_MS → relay ON now ──
+          digitalWrite(PIN_RELAY, HIGH);
+          g_motorOn          = true;
+          g_waterCheckActive = true;
+          g_waterCheckStart  = now;
+          g_waterDetected    = false;
+          g_stallTimer       = 0;
+          g_stallDetected    = false;
+          Serial.println("[RECV] ✔ RELAY ON  — servo confirmed at 0°");
+          sendStatusNow();   // immediate notification to sender
+
+        } else if (servoIntent == ServoIntent::STOPPING) {
+          // ── Servo held at 180° for SERVO_HOLD_MS → relay OFF now ──
+          digitalWrite(PIN_RELAY, LOW);
+          g_motorOn       = false;
+          g_stallTimer    = 0;
+          g_stallDetected = false;
+          Serial.println("[RECV] ✔ RELAY OFF — servo confirmed at 180°");
+          sendStatusNow();
+        }
+
+        motorServo.write(SERVO_NEUTRAL);
+        servoState = ServoState::RETURNING;
+        servoTimer = now;
+      }
+      break;
+
+    case ServoState::RETURNING:
+      if (now - servoTimer >= SERVO_BACK_MS) {
+        servoState  = ServoState::IDLE;
+        servoIntent = ServoIntent::NONE;
+        Serial.println("[RECV] servo → 90° neutral (idle)");
+
+        // Execute any command that arrived while servo was busy
+        if      (g_queuedCmd == 1) { g_queuedCmd = 0; activateMotor();   }
+        else if (g_queuedCmd == 2) { g_queuedCmd = 0; deactivateMotor(); }
+      }
+      break;
+
+    default: break;
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Water sensor — 30 s auto cut-off after relay ON
+// ═════════════════════════════════════════════════════════════════════════
+
+static void handleWaterSensor(unsigned long now) {
+  if (!g_waterCheckActive || g_waterDetected) return;
+
+  if (digitalRead(PIN_WATER) == LOW) {   // active LOW = water conducting
+    g_waterDetected    = true;
+    g_waterCheckActive = false;
+    Serial.println("[RECV] ✔ water detected — pump confirmed running");
+    sendStatusNow();
+    return;
+  }
+
+  if (now - g_waterCheckStart >= WATER_TIMEOUT_MS) {
+    Serial.println("[RECV] ✗ WATER TIMEOUT 30 s — auto cut-off");
+    g_waterCheckActive = false;
+    if (servoState == ServoState::IDLE) {
+      deactivateMotor();
+    } else {
+      g_queuedCmd = 2;   // servo busy — queue the stop
+    }
+    sendStatusNow();
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Stall detection — motor ON but no current for 5 s
+// ═════════════════════════════════════════════════════════════════════════
+
+static void handleStallDetect(unsigned long now) {
+  if (!g_motorOn) {
+    g_stallTimer    = 0;
+    g_stallDetected = false;
+    return;
+  }
+  if (fabsf(g_currentSmooth) < CURRENT_RUN_THRESH) {
+    if (g_stallTimer == 0) g_stallTimer = now;
+    if ((now - g_stallTimer > STALL_TIMEOUT_MS) && !g_stallDetected) {
+      g_stallDetected = true;
+      Serial.println("[RECV] ⚠ STALL — motor ON but current=0 for 5 s");
+      sendStatusNow();
+    }
+  } else {
+    // Current flowing again — clear stall
+    if (g_stallDetected) {
+      g_stallDetected = false;
+      Serial.println("[RECV] stall cleared — current resumed");
+      sendStatusNow();
+    }
+    g_stallTimer = 0;
+  }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  ESP-NOW callbacks — flags ONLY, no GPIO, no delay, no Serial
+// ═════════════════════════════════════════════════════════════════════════
+
+void espnowOnSend(uint8_t* /*mac*/, uint8_t /*status*/) { }
+
+void espnowOnRecv(uint8_t* /*mac*/, uint8_t* data, uint8_t len) {
+  if (len < sizeof(CmdPacket)) return;
+  CmdPacket pkt;
+  memcpy(&pkt, data, sizeof(pkt));
+  if (pkt.type != 0x01)      return;
+  if (pkt.seq == g_lastSeq)  return;   // dedup the 3 retries
+  g_lastSeq = pkt.seq;
+  g_rxFlag  = true;
+  if (pkt.cmd == 0x01) g_pendingOn  = true;
+  if (pkt.cmd == 0x02) g_pendingOff = true;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Setup
+// ═════════════════════════════════════════════════════════════════════════
+
+void setup() {
+  // ── Relay OFF — absolute first line before anything ───────────────────
+  pinMode(PIN_RELAY, OUTPUT);
+  digitalWrite(PIN_RELAY, LOW);
+
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n[RECV] boot");
+
+  // ── GPIO ──────────────────────────────────────────────────────────────
+  pinMode(PIN_BUILTIN_LED, OUTPUT);
+  digitalWrite(PIN_BUILTIN_LED, HIGH);   // off (active LOW)
+
+  pinMode(PIN_WATER, INPUT);             // external 10k pull-up to 3.3V
+  bool bootWater = (digitalRead(PIN_WATER) == LOW);
+  Serial.printf("[RECV] water sensor at boot: %s\n", bootWater ? "WET" : "DRY");
+
+  // ── Servo — explicit pulse range, fixes GPIO0 quirk ───────────────────
+  motorServo.attach(PIN_SERVO, 500, 2400);
+  motorServo.write(SERVO_NEUTRAL);
+  delay(500);
+  Serial.println("[RECV] servo at 90° neutral");
+
+  // ── Boot blink: 3× = receiver identifier (sender is 2×) ──────────────
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(PIN_BUILTIN_LED, LOW);  delay(200);
+    digitalWrite(PIN_BUILTIN_LED, HIGH); delay(200);
+  }
+
+  // ── Wi-Fi — join Sender's AP for channel sync ─────────────────────────
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(AP_SSID, AP_PASS);
+  WiFi.setOutputPower(20.5f);         // max TX power
+  wifi_set_phy_mode(PHY_MODE_11B);    // 802.11b = longest range
+
+  Serial.print("[RECV] connecting to AP");
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < AP_TIMEOUT_MS) {
+    delay(200); Serial.print('.');
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[RECV] joined AP  IP=%s  ch=%d\n",
+      WiFi.localIP().toString().c_str(), (int)WiFi.channel());
+  } else {
+    Serial.println("\n[RECV] AP not found — forcing channel " + String(WIFI_CH));
+    WiFi.disconnect();
+    wifi_set_channel(WIFI_CH);
+  }
+
+  // ── ESP-NOW init with 3 retries ───────────────────────────────────────
+  int tries = 3;
+  while (esp_now_init() != 0 && tries-- > 0) {
+    Serial.println("[RECV] ESP-NOW init failed — retrying...");
+    delay(500);
+  }
+  if (tries < 0) {
+    Serial.println("[RECV] ESP-NOW init FAILED 3× — rebooting");
+    delay(1000); ESP.restart();
+  }
+  esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+  esp_now_register_send_cb(espnowOnSend);
+  esp_now_register_recv_cb(espnowOnRecv);
+  esp_now_add_peer(BCAST_MAC, ESP_NOW_ROLE_COMBO, WIFI_CH, nullptr, 0);
+  Serial.println("[RECV] ESP-NOW ready (broadcast)");
+
+  // ── LoRa DEAD CODE ────────────────────────────────────────────────────
+  // LoRa.setPins(LORA_NSS, LORA_RST, LORA_DIO0);
+  // if (!LoRa.begin(LORA_FREQ)) { Serial.println("LoRa init failed"); }
+
+  Serial.println("[RECV] ready");
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+//  Main loop
+// ═════════════════════════════════════════════════════════════════════════
+
+void loop() {
+  unsigned long now = millis();
+
+  // ── EMA current sample (non-blocking) ────────────────────────────────
+  updateCurrentEMA(now);
+
+  // ── Builtin LED blink on packet received ─────────────────────────────
+  if (g_rxFlag) {
+    g_rxFlag     = false;
+    g_blinkUntil = now + BLINK_MS;
+    digitalWrite(PIN_BUILTIN_LED, LOW);
+  }
+  if (now >= g_blinkUntil) digitalWrite(PIN_BUILTIN_LED, HIGH);
+
+  // ── Command conflict: OFF always wins over ON ─────────────────────────
+  if (g_pendingOff && g_pendingOn) g_pendingOn = false;
+
+  // ── Execute commands queued by callback ──────────────────────────────
+  if (g_pendingOn) {
+    g_pendingOn = false;
+    if (servoState == ServoState::IDLE && !g_motorOn) {
+      activateMotor();
+    } else if (servoState != ServoState::IDLE) {
+      g_queuedCmd = 1;
+      Serial.println("[RECV] ON queued (servo busy)");
+    }
+    // if motorOn && idle → already running, ignore
+  }
+  if (g_pendingOff) {
+    g_pendingOff = false;
+    if (servoState == ServoState::IDLE && g_motorOn) {
+      deactivateMotor();
+    } else if (servoState != ServoState::IDLE) {
+      g_queuedCmd = 2;
+      Serial.println("[RECV] OFF queued (servo busy)");
+    }
+    // if !motorOn && idle → already off, ignore
+  }
+
+  // ── Servo state machine ───────────────────────────────────────────────
+  handleServo(now);
+
+  // ── Water sensor auto cut-off ─────────────────────────────────────────
+  handleWaterSensor(now);
+
+  // ── Stall detection ───────────────────────────────────────────────────
+  handleStallDetect(now);
+
+  // ── Periodic status → sender ──────────────────────────────────────────
+  sendStatusPeriodic(now);
+}

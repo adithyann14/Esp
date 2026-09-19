@@ -1,36 +1,38 @@
 package com.motordrive.esp32.data
 
 /**
- * Snapshot of everything the ESP8266 reports back in one /api/status call.
+ * Snapshot of everything the ESP8266 sender reports via GET /api/status.
  *
- * ESP8266 Arduino JSON format expected:
+ * ESP JSON format:
  * {
- *   "motorOn":   true,
- *   "voltageR":  231.5,   // MODULE A — phase R (V)
- *   "voltageY":  229.8,   // MODULE A — phase Y (V)
- *   "voltageB":  232.1,   // MODULE A — phase B (V)
- *   "current":   4.2,     // MODULE B — ACS712 current (A); >0.1 A = motor running
- *   "waterFlow": true     // MODULE C — water flow sensor state
+ *   "motorOn":          true,
+ *   "current":          4.2,       // ACS712 (A); threshold = 0.10 A on ESP, not app
+ *   "isRunning":        true,      // derived on ESP: motorOn OR current > 0.10 A
+ *   "waterDetected":    true,      // pipe-end sensor active-LOW; true = water flowing
+ *   "espNowConnected":  true       // receiver heard within last 10 s
  * }
  *
- * Fields not present in the JSON stay null; the UI shows "—".
- * Motor running state is derived from current > 0.1 A inside CurrentModule.
+ * Keys absent in the response stay null; UI shows "—".
+ * Motor ON/OFF banner is on the dashboard; CurrentModule shows current value only.
  */
 data class MotorState(
     val motorOn: Boolean = false,
 
-    // ── MODULE A: 3-phase voltages ────────────────────────────
+    // MODULE A: 3-phase voltages (sensors not fitted — keys absent, show "—")
     val voltageR: Float? = null,
     val voltageY: Float? = null,
     val voltageB: Float? = null,
 
-    // ── MODULE B: Current sensor ──────────────────────────────
+    // MODULE B: ACS712 current — threshold (0.10 A) lives on ESP, not in app
     val current: Float? = null,
 
-    // ── MODULE C: Water flow sensor ───────────────────────────
-    val waterFlowing: Boolean? = null,
+    // MODULE C: Pipe-end water sensor (active-LOW; LOW = conducting = water)
+    val waterDetected: Boolean? = null,
 
-    // ── Connection metadata ───────────────────────────────────
+    // ESP-NOW link health: true if receiver status packet arrived < 10 s ago
+    val espNowConnected: Boolean = false,
+
+    // Connection metadata
     val isConnected:   Boolean = false,
     val lastUpdatedMs: Long    = 0L,
     val errorMessage:  String? = null

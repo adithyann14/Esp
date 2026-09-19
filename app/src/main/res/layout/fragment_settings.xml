@@ -32,7 +32,6 @@
 
             <!-- ══════════════════════════════════════════════════ -->
             <!-- SECTION: SENSOR DISPLAY TOGGLES                   -->
-            <!-- Toggles save immediately — no Save button needed. -->
             <!-- ══════════════════════════════════════════════════ -->
             <LinearLayout
                 android:id="@+id/sensorDisplaySection"
@@ -50,7 +49,7 @@
                     android:letterSpacing="0.1"
                     android:layout_marginBottom="10dp" />
 
-                <!-- MODULE A — Voltage toggle -->
+                <!-- MODULE A — Voltage -->
                 <LinearLayout
                     android:id="@+id/sensorVoltageRow"
                     android:layout_width="match_parent"
@@ -90,7 +89,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="1dp" />
 
-                <!-- MODULE B — Current sensor toggle -->
+                <!-- MODULE B — Current (motor status is already in top banner) -->
                 <LinearLayout
                     android:id="@+id/sensorCurrentRow"
                     android:layout_width="match_parent"
@@ -108,13 +107,13 @@
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="Current &amp; Motor Status"
+                            android:text="Current"
                             android:textAppearance="?attr/textAppearanceBodyMedium" />
 
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="ACS712 current + running detection (I &gt; 0.1 A)"
+                            android:text="ACS712 reading (A) — running threshold on ESP (0.10 A)"
                             android:textAppearance="?attr/textAppearanceBodySmall"
                             android:textColor="?attr/colorOnSurfaceVariant" />
                     </LinearLayout>
@@ -130,7 +129,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="1dp" />
 
-                <!-- MODULE C — Water flow toggle -->
+                <!-- MODULE C — Water sensor -->
                 <LinearLayout
                     android:id="@+id/sensorWaterRow"
                     android:layout_width="match_parent"
@@ -148,13 +147,13 @@
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="Water Flow at Pipe End"
+                            android:text="Water at Pipe End"
                             android:textAppearance="?attr/textAppearanceBodyMedium" />
 
                         <TextView
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
-                            android:text="Sensor wired to discharge pipe end"
+                            android:text="Active-LOW sensor — auto cut-off at 30 s dry"
                             android:textAppearance="?attr/textAppearanceBodySmall"
                             android:textColor="?attr/colorOnSurfaceVariant" />
                     </LinearLayout>
@@ -266,7 +265,7 @@
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="Connect your phone to the MotorControl Wi-Fi AP."
+                    android:text="Connect your phone to the MotorControl Wi-Fi AP first."
                     android:textAppearance="?attr/textAppearanceBodySmall"
                     android:textColor="?attr/colorOnSurfaceVariant"
                     android:layout_marginBottom="16dp" />
@@ -304,7 +303,7 @@
                     android:layout_marginBottom="16dp" />
             </LinearLayout>
 
-            <!-- Save & Connect — connection settings only -->
+            <!-- Save & Connect -->
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnSave"
                 android:layout_width="match_parent"
@@ -313,6 +312,182 @@
                 android:layout_marginTop="8dp"
                 app:cornerRadius="12dp"
                 style="@style/Widget.Material3.Button" />
+
+            <!-- ══════════════════════════════════════════════════ -->
+            <!-- SECTION: DIAGNOSTICS                              -->
+            <!--   Serial Monitor — fetches /api/logs from ESP     -->
+            <!--   App Logcat    — in-process event log            -->
+            <!-- ══════════════════════════════════════════════════ -->
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="DIAGNOSTICS"
+                android:textAppearance="?attr/textAppearanceLabelSmall"
+                android:textColor="?attr/colorPrimary"
+                android:letterSpacing="0.1"
+                android:layout_marginTop="28dp"
+                android:layout_marginBottom="10dp" />
+
+            <!-- ── Serial Monitor card ──────────────────────────── -->
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                app:cardElevation="2dp"
+                app:cardCornerRadius="12dp"
+                android:layout_marginBottom="16dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="12dp">
+
+                    <!-- Header row -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginBottom="8dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="📟  Serial Monitor"
+                            android:textAppearance="?attr/textAppearanceTitleSmall" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnRefreshSerial"
+                            android:layout_width="wrap_content"
+                            android:layout_height="36dp"
+                            android:text="Refresh"
+                            android:textSize="12sp"
+                            android:layout_marginEnd="6dp"
+                            app:cornerRadius="8dp"
+                            style="@style/Widget.Material3.Button.TonalButton" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnClearSerial"
+                            android:layout_width="wrap_content"
+                            android:layout_height="36dp"
+                            android:text="Clear"
+                            android:textSize="12sp"
+                            app:cornerRadius="8dp"
+                            style="@style/Widget.Material3.Button.OutlinedButton" />
+                    </LinearLayout>
+
+                    <!-- Terminal display -->
+                    <ScrollView
+                        android:id="@+id/serialScrollView"
+                        android:layout_width="match_parent"
+                        android:layout_height="200dp"
+                        android:fillViewport="true">
+
+                        <TextView
+                            android:id="@+id/serialTerminalText"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:padding="10dp"
+                            android:text="— tap Refresh to fetch ESP log —"
+                            android:fontFamily="monospace"
+                            android:textSize="11sp"
+                            android:textColor="@color/terminal_text"
+                            android:background="@color/terminal_bg"
+                            android:lineSpacingExtra="3dp"
+                            android:textIsSelectable="true" />
+                    </ScrollView>
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="ESP serial output via GET /api/logs (sender + receiver logs combined)."
+                        android:textAppearance="?attr/textAppearanceBodySmall"
+                        android:textColor="?attr/colorOnSurfaceVariant"
+                        android:layout_marginTop="6dp" />
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
+            <!-- ── App Logcat card ───────────────────────────────── -->
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                app:cardElevation="2dp"
+                app:cardCornerRadius="12dp"
+                android:layout_marginBottom="32dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="12dp">
+
+                    <!-- Header row -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginBottom="8dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="🗒  App Logcat"
+                            android:textAppearance="?attr/textAppearanceTitleSmall" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnExportLogcat"
+                            android:layout_width="wrap_content"
+                            android:layout_height="36dp"
+                            android:text="Export"
+                            android:textSize="12sp"
+                            android:layout_marginEnd="6dp"
+                            app:cornerRadius="8dp"
+                            style="@style/Widget.Material3.Button.TonalButton" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnClearLogcat"
+                            android:layout_width="wrap_content"
+                            android:layout_height="36dp"
+                            android:text="Clear"
+                            android:textSize="12sp"
+                            app:cornerRadius="8dp"
+                            style="@style/Widget.Material3.Button.OutlinedButton" />
+                    </LinearLayout>
+
+                    <!-- Logcat display -->
+                    <ScrollView
+                        android:id="@+id/logcatScrollView"
+                        android:layout_width="match_parent"
+                        android:layout_height="200dp"
+                        android:fillViewport="true">
+
+                        <TextView
+                            android:id="@+id/logcatText"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:padding="10dp"
+                            android:text="— no events yet —"
+                            android:fontFamily="monospace"
+                            android:textSize="11sp"
+                            android:textColor="@color/terminal_text"
+                            android:background="@color/terminal_bg"
+                            android:lineSpacingExtra="3dp"
+                            android:textIsSelectable="true" />
+                    </ScrollView>
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="App events: connection, commands, sensor state changes. Export shares as text."
+                        android:textAppearance="?attr/textAppearanceBodySmall"
+                        android:textColor="?attr/colorOnSurfaceVariant"
+                        android:layout_marginTop="6dp" />
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
 
         </LinearLayout>
     </androidx.core.widget.NestedScrollView>
